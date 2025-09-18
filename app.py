@@ -372,6 +372,69 @@ else:
                 """,
                 unsafe_allow_html=True,
             )
+            # ... keep all your code above unchanged ...
+
+    if recs.empty:
+        st.warning("No schemes match your criteria. Try broadening the filters or change keywords.")
+    else:
+        # Display recommended schemes as cards
+        for _, row in recs.iterrows():
+            # --- Fix: ensure scheme name always visible ---
+            display_name = (
+                row.get("schemeName")
+                or row.get("title")
+                or row.get("name")
+                or row.get("__display_name")
+                or "Unknown Scheme"
+            )
+
+            # --- Fix: ensure description always visible ---
+            desc = (
+                row.get("description")
+                or row.get("about")
+                or row.get("details")
+                or "No description available."
+            )
+
+            eligibility = row.get("eligibility", "")
+            benefits = row.get("benefits", "")
+            cat = row.get("schemeCategory", "")
+            level = row.get("level", "")
+            state = row.get("state", "")
+            department = row.get("department", "")
+            score = row.get("__score", 0)
+
+            # Card HTML (adapts to dark/light via CSS above)
+            st.markdown(
+                f"""
+                <div class="scheme-card">
+                  <div class="scheme-card-inner">
+                    <div style="display:flex; justify-content:space-between; align-items:center;">
+                      <div style="flex:1">
+                        <div class="scheme-name"><strong>{display_name}</strong></div>
+                        <div class="muted">🏷️ {cat or 'N/A'} • 🌍 {level or 'N/A'} • 📍 {state or 'N/A'}</div>
+                      </div>
+                      <div style="text-align:right; margin-left:12px;">
+                        <div class="muted">Score: {int(score)}</div>
+                      </div>
+                    </div>
+                    <hr/>
+                    <div style="margin-top:6px;">
+                      <div><b>📝 Description:</b> {desc}</div>
+                      <div style="margin-top:4px;"><b>✅ Eligibility:</b> {eligibility if eligibility else 'N/A'}</div>
+                      <div style="margin-top:4px;"><b>💡 Benefits:</b> {benefits if benefits else 'N/A'}</div>
+                      <div style="margin-top:8px; font-size:13px;" class="muted">Department: {department or 'N/A'}</div>
+                    </div>
+                  </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+# Footer / helpful notes
+st.markdown("---")
+st.caption("Tip: Fill your social category, occupation and state for more accurate results. "
+           "Saved user details are stored in `users_db.csv` (owner-only view).")
 
 # Footer / helpful notes
 st.markdown("---")
