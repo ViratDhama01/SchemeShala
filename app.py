@@ -79,7 +79,7 @@ def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
 def _load_dataframe(path: Path) -> pd.DataFrame:
     if not path.exists():
         raise FileNotFoundError(
-            f"CSV not found at {path.resolve()} — place 'cleaned_data.csv' next to app.py"
+            f"CSV not found at {path.resolve()} — place 'gov.csv' next to app.py"
         )
     try:
         df = pd.read_csv(path, engine="python", on_bad_lines="skip")
