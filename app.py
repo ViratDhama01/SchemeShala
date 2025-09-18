@@ -1,6 +1,6 @@
 # app.py
 from pathlib import Path
-from typing import Optional, List
+from typing import List
 import pandas as pd
 import streamlit as st
 import os
@@ -13,16 +13,16 @@ APP_NAME = "🌐 SchemeSarthi"
 DATA_FILE = Path(__file__).with_name("gov.csv")
 USERS_DB = Path(__file__).with_name("users_db.csv")
 
-# Admin password: override by setting environment var SC_ADMIN_PW
-ADMIN_PASSWORD = os.environ.get("SC_ADMIN_PW", "schemesarthi_admin_2025")
+# Admin password: overridden by env var SC_ADMIN_PW; default set to requested value
+ADMIN_PASSWORD = os.environ.get("SC_ADMIN_PW", "ADMIN2025")
 
 DEFAULT_LIMIT = 5
 MAX_LIMIT = 50
 
-# Columns we try to use if present (used to build search blob)
+# Text columns to include in search blob
 TEXT_COL_CANDIDATES: List[str] = [
-    "title", "name", "schemeName", "description", "eligibility",
-    "schemeCategory", "category", "level", "state", "department", "tags", "benefits"
+    "title", "name", "schemeName", "description", "details", "eligibility",
+    "schemeCategory", "category", "level", "state", "department", "tags", "benefits", "scheme_name"
 ]
 
 # Full list of Indian states + UTs (expanded)
@@ -32,7 +32,6 @@ ALL_STATES = [
     "Madhya Pradesh","Maharashtra","Manipur","Meghalaya","Mizoram","Nagaland",
     "Odisha","Punjab","Rajasthan","Sikkim","Tamil Nadu","Telangana","Tripura",
     "Uttar Pradesh","Uttarakhand","West Bengal",
-    # Union Territories
     "Andaman and Nicobar Islands","Chandigarh","Dadra and Nagar Haveli and Daman and Diu",
     "Delhi","Jammu and Kashmir","Ladakh","Lakshadweep","Puducherry"
 ]
@@ -53,101 +52,86 @@ EDUCATION_LEVELS = ["Any", "Below 8th", "8th", "10th", "12th", "Diploma", "Gradu
 CATEGORIES = ["Any", "General", "OBC", "SC", "ST", "EWS"]
 
 # ================================
-# Helpers: load & normalize (robust)
+# Load & normalize CSV
 # ================================
 @st.cache_data
 def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    # normalize column names (strip)
+
+    # strip spaces from headers
     df.columns = [c.strip() for c in df.columns]
 
-    # rename common variants
+    # drop index-like Unnamed columns if any
+    unnamed_cols = [c for c in df.columns if c.startswith("Unnamed")]
+    if unnamed_cols:
+        df = df.drop(columns=unnamed_cols, errors="ignore")
+
+    # Map common CSV header variants from your file to expected names:
+    # - scheme_name -> schemeName
+    # - details -> description
     rename_map = {}
     for c in df.columns:
         lc = c.lower()
-        if lc in ("scheme name", "schemename", "scheme_name"):
+        if lc == "scheme_name" or lc == "scheme name":
             rename_map[c] = "schemeName"
-        if lc in ("cat", "categories"):
-            rename_map[c] = "schemeCategory"
-        if lc in ("benefit", "benefits"):
+        if lc == "details" or lc == "detail":
+            rename_map[c] = "description"
+        # accept other variations
+        if lc == "benefits" or lc == "benefit":
             rename_map[c] = "benefits"
+        if lc == "tags":
+            rename_map[c] = "tags"
+        if lc == "schemecategory" or lc == "scheme category":
+            rename_map[c] = "schemeCategory"
+
     if rename_map:
         df = df.rename(columns=rename_map)
 
-    # ensure expected text columns exist
-    for col in TEXT_COL_CANDIDATES:
+    # Ensure text columns exist (create blanks if missing)
+    for col in TEXT_COL_CANDIDATES + ["schemeName", "description", "benefits", "tags", "schemeCategory", "level", "state", "department", "eligibility"]:
         if col not in df.columns:
             df[col] = ""
 
-    # detect best scheme-name column (prefer explicit ones)
-    name_keywords = ["schemename", "scheme name", "scheme_name", "scheme", "title", "name"]
-    name_col = None
-    for kw in name_keywords:
-        for c in df.columns:
-            if kw in c.lower():
-                name_col = c
-                break
-        if name_col:
-            break
+    # Build a robust display name column:
+    # prefer schemeName, then scheme_name, then title, then name
+    def _preferred_name(row):
+        for col in ("schemeName", "scheme_name", "title", "name"):
+            if col in row and pd.notna(row[col]) and str(row[col]).strip():
+                return str(row[col]).strip().strip('"')
+        # As a last attempt, pick slug or first non-empty column
+        for col in df.columns:
+            val = row.get(col, "")
+            if isinstance(val, str) and val.strip() and col not in ("__blob", "__display_name", "__description"):
+                return val.strip().strip('"')
+        return "Unknown Scheme"
 
-    if name_col:
-        df["__display_name"] = df[name_col].astype(str).str.strip().replace({"": None}).fillna("")
-    else:
-        # fallback try common fields then fallback to Unknown Scheme
-        fallback = None
-        for c in ("schemeName", "title", "name"):
-            if c in df.columns:
-                fallback = c
-                break
-        if fallback:
-            df["__display_name"] = df[fallback].astype(str).str.strip().replace({"": None}).fillna("")
-        else:
-            df["__display_name"] = "Unknown Scheme"
+    df["__display_name"] = df.apply(_preferred_name, axis=1)
 
-    # detect description column
-    desc_keywords = ["description", "desc", "about", "details", "summary", "overview"]
-    desc_col = None
-    for kw in desc_keywords:
-        for c in df.columns:
-            if kw in c.lower():
-                desc_col = c
-                break
-        if desc_col:
-            break
+    # Build description field: prefer description, then details, then any long text column
+    def _preferred_desc(row):
+        for col in ("description", "details", "about", "summary", "overview"):
+            if col in row and pd.notna(row[col]) and str(row[col]).strip():
+                return str(row[col]).strip().strip('"')
+        # fallback: try 'eligibility' or 'benefits' if they contain sentences
+        for col in ("eligibility", "benefits"):
+            if col in row and pd.notna(row[col]) and str(row[col]).strip():
+                txt = str(row[col]).strip()
+                # short values prefer not to be description; but still return something
+                return txt
+        return "No description available."
 
-    if desc_col:
-        df["__description"] = df[desc_col].astype(str).str.strip().replace({"": None}).fillna("")
-    else:
-        # try some fallback columns
-        fallback_desc = None
-        for c in ("description", "details", "about"):
-            if c in df.columns:
-                fallback_desc = c
-                break
-        if fallback_desc:
-            df["__description"] = df[fallback_desc].astype(str).str.strip().replace({"": None}).fillna("")
-        else:
-            df["__description"] = "No description available."
+    df["__description"] = df.apply(_preferred_desc, axis=1)
 
-    # Build searchable blob (include display_name & description explicitly)
-    text_cols_present = [c for c in TEXT_COL_CANDIDATES if c in df.columns]
-    # always include __display_name and __description
-    blob_cols = list(set(text_cols_present + ["__display_name", "__description"]))
+    # Build searchable blob (include display name and description explicitly)
+    blob_cols = list({c for c in TEXT_COL_CANDIDATES if c in df.columns} | {"__display_name", "__description"})
     df["__blob"] = df[blob_cols].fillna("").astype(str).agg(" ".join, axis=1).str.lower()
 
-    # Ensure state and level columns exist
-    if "state" not in df.columns:
-        df["state"] = ""
-    if "level" not in df.columns:
-        df["level"] = ""
-
-    # Ensure eligibility/benefits exist
-    if "eligibility" not in df.columns:
-        df["eligibility"] = ""
-    if "benefits" not in df.columns:
-        df["benefits"] = ""
-    if "schemeCategory" not in df.columns:
-        df["schemeCategory"] = ""
+    # Ensure state/level columns are strings
+    df["state"] = df["state"].astype(str).fillna("")
+    df["level"] = df["level"].astype(str).fillna("")
+    df["eligibility"] = df["eligibility"].astype(str).fillna("")
+    df["benefits"] = df["benefits"].astype(str).fillna("")
+    df["schemeCategory"] = df["schemeCategory"].astype(str).fillna("")
 
     return df
 
@@ -165,7 +149,7 @@ def _load_dataframe(path: Path) -> pd.DataFrame:
 df = _load_dataframe(DATA_FILE)
 
 # ================================
-# Scoring recommender (occupation prioritization etc.)
+# Recommender / Scoring
 # ================================
 def _keywords_from_profile(profile: dict) -> List[str]:
     kws = []
@@ -195,23 +179,23 @@ def _score_rows(profile: dict, data: pd.DataFrame) -> pd.DataFrame:
     out = data.copy()
     blob = out["__blob"].fillna("")
 
-    # base score
+    # base score (zeros)
     score = pd.Series(0, index=out.index)
 
     # keyword matches: +2
     for kw in kws:
         score += blob.str.contains(kw, na=False).astype(int) * 2
 
-    # occupation priority: +6 if occupation appears strongly
+    # occupation priority: strong boost
     occ = profile.get("occupation", "")
     if occ and isinstance(occ, str) and occ.lower() != "any":
         occ_kw = occ.strip().lower()
         score += blob.str.contains(occ_kw, na=False).astype(int) * 6
-        for col in ("eligibility", "schemeCategory", "__description"):
+        for col in ("eligibility", "schemeCategory", "__description", "benefits"):
             if col in out.columns:
                 score += out[col].astype(str).str.lower().str.contains(occ_kw, na=False).astype(int) * 3
 
-    # category boost (e.g., OBC/SC/ST) +3 if category is mentioned
+    # category boost (OBC/SC/ST/EWS)
     cat = profile.get("category", "")
     if cat and isinstance(cat, str) and cat.lower() != "any":
         cat_kw = cat.strip().lower()
@@ -241,7 +225,7 @@ def recommend(profile: dict, data: pd.DataFrame, limit: int = DEFAULT_LIMIT) -> 
     return recs
 
 # ================================
-# UI (sidebar + main)
+# Streamlit UI + CSS
 # ================================
 st.set_page_config(page_title=APP_NAME, page_icon="🚀", layout="wide")
 st.markdown(
@@ -272,7 +256,7 @@ st.markdown(
 st.title(APP_NAME)
 st.markdown("### Discover government schemes tailored to your profile")
 
-# Sidebar: User profile + filters + save details
+# Sidebar: Profile + save details
 st.sidebar.header("👤 Your Profile & Filters")
 
 # Personal details (optional)
@@ -314,6 +298,7 @@ states_for_select = ["Any"] + sorted([s for s in ALL_STATES if s])
 if not df.empty:
     df_states = sorted([s for s in df["state"].dropna().unique().tolist() if s and s not in states_for_select])
     if df_states:
+        # add unique CSV states too
         states_for_select = ["Any"] + sorted(set(states_for_select + df_states))
 user_state = st.sidebar.selectbox("Select your state", states_for_select, index=0)
 
@@ -356,7 +341,7 @@ results = df.copy()
 if results.empty:
     st.warning("No gov.csv found or it's empty. Please upload gov.csv in the app folder.")
 else:
-    # State filter: show selected state schemes + central schemes
+    # State filter: show selected state schemes + central/national/all-india
     if profile["location"]:
         results = results[
             results["state"].astype(str).str.contains(profile["location"], case=False, na=False) |
@@ -393,7 +378,7 @@ else:
         # Display recommended schemes as cards
         for _, row in recs.iterrows():
             display_name = row.get("__display_name") or row.get("schemeName") or row.get("title") or row.get("name") or "Unknown Scheme"
-            desc = row.get("__description") or row.get("description") or "No description available."
+            desc = row.get("__description") or row.get("description") or row.get("details") or "No description available."
             eligibility = row.get("eligibility", "") or "N/A"
             benefits = row.get("benefits", "") or "N/A"
             cat = row.get("schemeCategory", "") or "N/A"
