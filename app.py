@@ -4,8 +4,8 @@ from pathlib import Path
 from typing import Optional, List
 
 import pandas as pd
-from fastapi import FastAPI, Query
-from fastapi.middleware.cors import CORSMiddleware
+#from fastapi import FastAPI, Query
+#from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
 
