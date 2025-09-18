@@ -1,118 +1,207 @@
-import streamlit as st
+from pathlib import Path
+from typing import Optional, List
 import pandas as pd
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
+import streamlit as st
 
 # ================================
-# Load Data
+# Config
 # ================================
-@st.cache_data
-def load_data():
-    try:
-        df = pd.read_csv("gov.csv", engine="python", on_bad_lines="skip")
-    except Exception:
-        df = pd.read_csv("gov.csv", engine="python", on_bad_lines="skip", encoding_errors="ignore")
-    df = df.fillna("")
+APP_NAME = "SchemeSarthi 🚀"
+DATA_FILE = Path(__file__).with_name("gov.csv")  # must be in the same folder
+DEFAULT_LIMIT = 5
+MAX_LIMIT = 50
+
+# Columns we try to use if present
+TEXT_COL_CANDIDATES: List[str] = [
+    "title",
+    "name",
+    "schemeName",
+    "description",
+    "eligibility",
+    "schemeCategory",
+    "category",
+    "level",
+    "state",
+    "department",
+]
+
+NUM_COL_CANDIDATES = {
+    "minAge": ("age", ">="),
+    "maxAge": ("age", "<="),
+    "incomeLimit": ("income", ">="),  # max income threshold
+}
+
+# ================================
+# Data loading & normalization
+# ================================
+def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = [c.strip() for c in df.columns]
+
+    rename_map = {}
+    for c in df.columns:
+        lc = c.lower()
+        if lc == "eligibility" and c != "eligibility":
+            rename_map[c] = "eligibility"
+        if lc == "scheme name" or lc == "schemename":
+            rename_map[c] = "schemeName"
+        if lc == "cat" or lc == "categories":
+            rename_map[c] = "schemeCategory"
+    if rename_map:
+        df = df.rename(columns=rename_map)
+
+    for col in TEXT_COL_CANDIDATES:
+        if col not in df.columns:
+            df[col] = ""
+
+    text_cols_present = [c for c in TEXT_COL_CANDIDATES if c in df.columns]
+    df["__blob"] = (
+        df[text_cols_present]
+        .fillna("")
+        .astype(str)
+        .agg(" ".join, axis=1)
+        .str.lower()
+    )
     return df
 
-df = load_data()
 
-# Combine text features for ML
-if not df.empty:
-    df["combined_text"] = (
-        df["scheme_name"].astype(str) + " " +
-        df["benefits"].astype(str) + " " +
-        df["eligibility"].astype(str) + " " +
-        df["tags"].astype(str)
+def _load_dataframe(path: Path) -> pd.DataFrame:
+    if not path.exists():
+        raise FileNotFoundError(
+            f"CSV not found at {path.resolve()} — place 'gov.csv' next to app.py"
+        )
+    try:
+        df = pd.read_csv(path, engine="python", on_bad_lines="skip")
+    except Exception:
+        df = pd.read_csv(
+            path, engine="python", on_bad_lines="skip", encoding_errors="ignore"
+        )
+    return _normalize_columns(df)
+
+
+# Load data
+try:
+    df = _load_dataframe(DATA_FILE)
+except Exception as e:
+    df = pd.DataFrame(
+        {
+            "title": ["Data failed to load"],
+            "description": [str(e)],
+            "eligibility": [""],
+            "schemeCategory": [""],
+            "level": [""],
+            "__blob": [""],
+        }
     )
 
-    vectorizer = TfidfVectorizer(stop_words="english", max_features=5000)
-    X = vectorizer.fit_transform(df["combined_text"])
-else:
-    vectorizer, X = None, None
 
 # ================================
-# Helper Functions
+# Profile class (simple, no Pydantic)
 # ================================
-def filter_schemes(profile, df):
-    filtered = df.copy()
-
-    if profile.get("category"):
-        if "schemeCategory" in df.columns:
-            filtered = filtered[
-                filtered["schemeCategory"].str.contains(profile["category"], case=False, na=False)
-            ]
-
-    if profile.get("location"):
-        if "level" in df.columns:
-            filtered = filtered[
-                filtered["level"].str.contains(profile["location"], case=False, na=False)
-            ]
-
-    if profile.get("income"):
-        if "eligibility" in df.columns:
-            filtered = filtered[
-                filtered["eligibility"].str.contains("income", case=False, na=False)
-            ]
-
-    return filtered
+class Profile:
+    def __init__(
+        self,
+        age: Optional[int] = None,
+        income: Optional[float] = None,
+        occupation: Optional[str] = None,
+        education: Optional[str] = None,
+        location: Optional[str] = None,
+        category: Optional[str] = None,
+    ):
+        self.age = age
+        self.income = income
+        self.occupation = occupation
+        self.education = education
+        self.location = location
+        self.category = category
 
 
-def recommend(profile_text, top_n=5):
-    if vectorizer is None or X is None:
-        return pd.DataFrame()
+# ================================
+# Recommender system
+# ================================
+def _keywords_from_profile(p: Profile) -> List[str]:
+    kws: List[str] = []
+    for s in [p.occupation, p.education, p.location, p.category]:
+        if s:
+            s = str(s).strip().lower()
+            if s:
+                kws.append(s)
+    return kws
 
-    user_vec = vectorizer.transform([profile_text])
-    sim = cosine_similarity(user_vec, X).flatten()
-    idx = sim.argsort()[-top_n:][::-1]
-    return df.iloc[idx][["scheme_name", "benefits", "eligibility"]]
+
+def _apply_numeric_filters(p: Profile, data: pd.DataFrame) -> pd.DataFrame:
+    out = data
+    if p.age is not None:
+        if "minAge" in out.columns:
+            out = out[(out["minAge"].fillna(-1).astype(float) <= float(p.age))]
+        if "maxAge" in out.columns:
+            out = out[(out["maxAge"].fillna(10**9).astype(float) >= float(p.age))]
+    if p.income is not None and "incomeLimit" in out.columns:
+        out = out[(out["incomeLimit"].fillna(10**12).astype(float) >= float(p.income))]
+    return out
+
+
+def _score_rows(p: Profile, data: pd.DataFrame) -> pd.DataFrame:
+    kws = _keywords_from_profile(p)
+    if not kws:
+        out = data.copy()
+        out["__score"] = 0
+        return out
+
+    out = data.copy()
+    blob = out["__blob"].fillna("")
+    score = pd.Series(0, index=out.index)
+    for kw in kws:
+        contains_kw = blob.str.contains(kw, na=False)
+        score = score + (contains_kw.astype(int) * 2)
+        for col in ("schemeCategory", "level", "eligibility"):
+            if col in out.columns:
+                score = score + out[col].fillna("").astype(str).str.lower().str.contains(kw, na=False).astype(int)
+    out["__score"] = score
+    return out
+
+
+def recommend(profile: Profile, data: pd.DataFrame, limit: int = DEFAULT_LIMIT) -> pd.DataFrame:
+    filtered = _apply_numeric_filters(profile, data)
+    scored = _score_rows(profile, filtered)
+    if scored["__score"].max() == 0:
+        return scored.head(limit)
+    recs = scored.sort_values(["__score", "title"], ascending=[False, True]).head(limit)
+    return recs
+
 
 # ================================
 # Streamlit App
 # ================================
-st.title("SchemeSarthi 🚀")
-st.write("Find government schemes based on your profile!")
+st.title(APP_NAME)
 
-# User profile input
-profile = {
-    "age": st.number_input("Age", min_value=0, max_value=120, value=25),
-    "income": st.number_input("Income", min_value=0, value=50000),
-    "location": st.text_input("Location (e.g., Rural, Urban, State)"),
-    "category": st.text_input("Category (e.g., Farmer, Student, Women)"),
-    "occupation": st.text_input("Occupation"),
-    "education": st.text_input("Education"),
-}
+st.sidebar.header("Your Profile")
+age = st.sidebar.number_input("Age", min_value=0, step=1, value=21)
+income = st.sidebar.number_input("Income", min_value=0, step=1000, value=200000)
+occupation = st.sidebar.text_input("Occupation", "Student")
+education = st.sidebar.text_input("Education", "")
+location = st.sidebar.text_input("Location", "Rural")
+category = st.sidebar.text_input("Category", "Education")
+limit = st.sidebar.slider("Number of recommendations", 1, MAX_LIMIT, DEFAULT_LIMIT)
 
-if st.button("Get Scheme Recommendations"):
-    if df.empty:
-        st.warning("No data loaded. Please upload gov.csv file.")
-    else:
-        # Step 1: Apply filters
-        filtered = filter_schemes(profile, df)
+profile = Profile(age=age, income=income, occupation=occupation, education=education, location=location, category=category)
 
-        # Step 2: Build profile text for ML recommendation
-        profile_text = " ".join([str(v) for v in profile.values() if v])
-        if not profile_text.strip():
-            profile_text = "government scheme"
+st.subheader("Recommended Schemes")
+recs = recommend(profile, df, limit=limit)
 
-        recs = recommend(profile_text, top_n=5)
+preferred_cols = [
+    "title",
+    "schemeName",
+    "schemeCategory",
+    "level",
+    "eligibility",
+    "description",
+    "state",
+    "department",
+    "__score",
+]
+present = [c for c in preferred_cols if c in recs.columns]
+if not present:
+    present = list(recs.columns)
 
-        # Final result: intersection of filters + recs
-        if not filtered.empty and not recs.empty:
-            final = pd.merge(
-                filtered, recs, on="scheme_name", how="inner"
-            )
-        elif not recs.empty:
-            final = recs
-        else:
-            final = filtered
-
-        st.subheader("Recommended Schemes")
-        if final.empty:
-            st.write("No matching schemes found.")
-        else:
-            for _, row in final.iterrows():
-                st.markdown(f"### {row['scheme_name']}")
-                st.write(f"**Benefits:** {row['benefits']}")
-                st.write(f"**Eligibility:** {row['eligibility']}")
-                st.markdown("---")
+st.dataframe(recs[present])
